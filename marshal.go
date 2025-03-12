@@ -484,50 +484,43 @@ func makeBody(value reflect.Value, params fieldParameters) (e encoder, err error
 	case reflect.Struct:
 		t := v.Type()
 
-		for i := 0; i < t.NumField(); i++ {
-			if !t.Field(i).IsExported() {
-				return nil, StructuralError{"struct contains unexported fields"}
-			}
-		}
-
-		startingField := 0
-
 		n := t.NumField()
 		if n == 0 {
 			return bytesEncoder(nil), nil
 		}
 
-		// If the first element of the structure is a non-empty
-		// RawContents, then we don't bother serializing the rest.
-		if t.Field(0).Type == rawContentsType {
-			s := v.Field(0)
-			if s.Len() > 0 {
-				bytes := s.Bytes()
-				/* The RawContents will contain the tag and
-				 * length fields but we'll also be writing
-				 * those ourselves, so we strip them out of
-				 * bytes */
-				return bytesEncoder(stripTagAndLength(bytes)), nil
+		var encoders []encoder
+		for i := 0; i < t.NumField(); i++ {
+			fieldParams := parseFieldParameters(t.Field(i).Tag.Get("asn1"))
+			if !t.Field(i).IsExported() || fieldParams.skip {
+				continue
 			}
-
-			startingField = 1
-		}
-
-		switch n1 := n - startingField; n1 {
-		case 0:
-			return bytesEncoder(nil), nil
-		case 1:
-			return makeField(v.Field(startingField), parseFieldParameters(t.Field(startingField).Tag.Get("asn1")))
-		default:
-			m := make([]encoder, n1)
-			for i := 0; i < n1; i++ {
-				m[i], err = makeField(v.Field(i+startingField), parseFieldParameters(t.Field(i+startingField).Tag.Get("asn1")))
-				if err != nil {
-					return nil, err
+			// If the first element of the structure is a non-empty
+			// RawContents, then we don't bother serializing the rest.
+			if len(encoders) == 0 && t.Field(0).Type == rawContentsType {
+				s := v.Field(0)
+				if s.Len() > 0 {
+					bytes := s.Bytes()
+					/* The RawContents will contain the tag and
+					 * length fields but we'll also be writing
+					 * those ourselves, so we strip them out of
+					 * bytes */
+					return bytesEncoder(stripTagAndLength(bytes)), nil
 				}
+				continue
 			}
-
-			return multiEncoder(m), nil
+			e, err := makeField(v.Field(i), fieldParams)
+			if err != nil {
+				return nil, err
+			}
+			encoders = append(encoders, e)
+		}
+		if len(encoders) == 0 {
+			return bytesEncoder(nil), nil
+		} else if len(encoders) == 1 {
+			return encoders[0], nil
+		} else {
+			return multiEncoder(encoders), nil
 		}
 	case reflect.Slice:
 		sliceType := v.Type()
@@ -578,6 +571,7 @@ func makeField(v reflect.Value, params fieldParameters) (e encoder, err error) {
 		return nil, fmt.Errorf("asn1: cannot marshal nil value")
 	}
 	// If the field is an interface{} then recurse into it.
+	//  v.Kind() == reflect.Ptr maybe can add ptr
 	if v.Kind() == reflect.Interface && v.Type().NumMethod() == 0 {
 		return makeField(v.Elem(), params)
 	}

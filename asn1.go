@@ -910,26 +910,19 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 	case reflect.Struct:
 		structType := fieldType
 
-		for i := 0; i < structType.NumField(); i++ {
-			if !structType.Field(i).IsExported() {
-				err = StructuralError{"struct contains unexported fields"}
-				return
-			}
-		}
-
-		if structType.NumField() > 0 &&
-			structType.Field(0).Type == rawContentsType {
-			bytes := bytes[initOffset:offset]
-			val.Field(0).Set(reflect.ValueOf(RawContent(bytes)))
-		}
-
 		innerOffset := 0
 		for i := 0; i < structType.NumField(); i++ {
 			field := structType.Field(i)
-			if i == 0 && field.Type == rawContentsType {
+			fieldParams := parseFieldParameters(field.Tag.Get("asn1"))
+			if !field.IsExported() || fieldParams.skip {
 				continue
 			}
-			innerOffset, err = parseField(val.Field(i), innerBytes, innerOffset, parseFieldParameters(field.Tag.Get("asn1")))
+			if innerOffset == 0 && field.Type == rawContentsType {
+				bytes := bytes[initOffset:offset]
+				val.Field(0).Set(reflect.ValueOf(RawContent(bytes)))
+				continue
+			}
+			innerOffset, err = parseField(val.Field(i), innerBytes, innerOffset, fieldParams)
 			if err != nil {
 				return
 			}

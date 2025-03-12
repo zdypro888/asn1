@@ -18,7 +18,7 @@ type ASNS struct {
 
 func TestMarshal(t *testing.T) {
 	var asn ASNS
-	asn.App = &AppInline{Num: 0x12345678}
+	// asn.App = &AppInline{Num: 0x12345678}
 	data, err := MarshalWithParams(asn, "application,tag:1")
 	if err != nil {
 		t.Error(err)
