@@ -123,10 +123,15 @@ func parseFieldParameters(str string) (ret fieldParameters) {
 				*ret.defaultValue = i
 			}
 		case strings.HasPrefix(part, "tag:"):
-			i, err := strconv.Atoi(part[4:])
-			if err == nil {
+			if part[4:] == "x" {
 				ret.tag = new(int)
-				*ret.tag = i
+				*ret.tag = -1
+			} else {
+				i, err := strconv.Atoi(part[4:])
+				if err == nil {
+					ret.tag = new(int)
+					*ret.tag = i
+				}
 			}
 		case part == "set":
 			ret.set = true

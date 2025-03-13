@@ -747,7 +747,7 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 			err = StructuralError{"explicit tag has no child"}
 			return
 		}
-		if t.class == expectedClass && t.tag == *params.tag && (t.length == 0 || t.isCompound) {
+		if t.class == expectedClass && (t.tag == *params.tag || *params.tag == -1) && (t.length == 0 || t.isCompound) {
 			if fieldType == rawValueType {
 				// The inner element should not be parsed for RawValues.
 			} else if t.length > 0 {
