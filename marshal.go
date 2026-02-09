@@ -163,6 +163,38 @@ func (i int64Encoder) Encode(dst []byte) {
 	}
 }
 
+type uint64Encoder uint64
+
+func (i uint64Encoder) Len() int {
+	if i == 0 {
+		return 1
+	}
+	n := 0
+	v := uint64(i)
+	for v > 0 {
+		n++
+		v >>= 8
+	}
+	// ASN.1 INTEGER 是有符号的，无符号值最高位为 1 时需要前导 0x00
+	if uint64(i)>>(uint(n-1)*8)&0x80 != 0 {
+		n++
+	}
+	return n
+}
+
+func (i uint64Encoder) Encode(dst []byte) {
+	n := i.Len()
+	v := uint64(i)
+	// 前导 0x00 (如果有)
+	if n > 0 && dst[0] == 0 {
+		// 先清零
+	}
+	for j := 0; j < n; j++ {
+		dst[n-1-j] = byte(v)
+		v >>= 8
+	}
+}
+
 func base128IntLength(n int64) int {
 	if n == 0 {
 		return 1
@@ -481,46 +513,70 @@ func makeBody(value reflect.Value, params fieldParameters) (e encoder, err error
 		return byte00Encoder, nil
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return int64Encoder(v.Int()), nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return uint64Encoder(v.Uint()), nil
 	case reflect.Struct:
 		t := v.Type()
+
+		startingField := 0
 
 		n := t.NumField()
 		if n == 0 {
 			return bytesEncoder(nil), nil
 		}
 
-		var encoders []encoder
-		for i := 0; i < t.NumField(); i++ {
-			fieldParams := parseFieldParameters(t.Field(i).Tag.Get("asn1"))
-			if !t.Field(i).IsExported() || fieldParams.skip {
-				continue
+		// If the first element of the structure is a non-empty
+		// RawContents, then we don't bother serializing the rest.
+		if t.Field(0).Type == rawContentsType {
+			s := v.Field(0)
+			if s.Len() > 0 {
+				bytes := s.Bytes()
+				/* The RawContents will contain the tag and
+				 * length fields but we'll also be writing
+				 * those ourselves, so we strip them out of
+				 * bytes */
+				return bytesEncoder(stripTagAndLength(bytes)), nil
 			}
-			// If the first element of the structure is a non-empty
-			// RawContents, then we don't bother serializing the rest.
-			if len(encoders) == 0 && t.Field(0).Type == rawContentsType {
-				s := v.Field(0)
-				if s.Len() > 0 {
-					bytes := s.Bytes()
-					/* The RawContents will contain the tag and
-					 * length fields but we'll also be writing
-					 * those ourselves, so we strip them out of
-					 * bytes */
-					return bytesEncoder(stripTagAndLength(bytes)), nil
-				}
-				continue
-			}
-			e, err := makeField(v.Field(i), fieldParams)
-			if err != nil {
-				return nil, err
-			}
-			encoders = append(encoders, e)
+
+			startingField = 1
 		}
-		if len(encoders) == 0 {
+
+		// 收集需要编码的字段 (跳过 "-"、非导出、inline 展平)
+		var m []encoder
+		for i := startingField; i < n; i++ {
+			field := t.Field(i)
+			// 跳过非导出字段
+			if !field.IsExported() {
+				continue
+			}
+			fp := parseFieldParameters(field.Tag.Get("asn1"))
+			// asn1:"-" 跳过此字段
+			if fp.skip {
+				continue
+			}
+			// 匿名 struct 字段 (inline): 展平其子字段
+			if field.Anonymous && field.Type.Kind() == reflect.Struct {
+				enc, innerErr := makeBody(v.Field(i), fp)
+				if innerErr != nil {
+					return nil, innerErr
+				}
+				m = append(m, enc)
+				continue
+			}
+			enc, innerErr := makeField(v.Field(i), fp)
+			if innerErr != nil {
+				return nil, innerErr
+			}
+			m = append(m, enc)
+		}
+
+		switch len(m) {
+		case 0:
 			return bytesEncoder(nil), nil
-		} else if len(encoders) == 1 {
-			return encoders[0], nil
-		} else {
-			return multiEncoder(encoders), nil
+		case 1:
+			return m[0], nil
+		default:
+			return multiEncoder(m), nil
 		}
 	case reflect.Slice:
 		sliceType := v.Type()
@@ -566,18 +622,79 @@ func makeBody(value reflect.Value, params fieldParameters) (e encoder, err error
 	return nil, StructuralError{"unknown Go type"}
 }
 
+// makeCompoundValue 将 CompoundValue 编码为带 tag 的 DER 结构。
+// 递归处理 Items 中的每个子元素。
+func makeCompoundValue(cv CompoundValue, params fieldParameters) (encoder, error) {
+	var body encoder
+	if len(cv.Items) == 0 {
+		body = bytesEncoder(nil)
+	} else {
+		m := make([]encoder, 0, len(cv.Items))
+		for _, item := range cv.Items {
+			enc, err := makeField(reflect.ValueOf(item), fieldParameters{})
+			if err != nil {
+				return nil, err
+			}
+			m = append(m, enc)
+		}
+		if len(m) == 1 {
+			body = m[0]
+		} else {
+			body = multiEncoder(m)
+		}
+	}
+	t := new(taggedEncoder)
+	t.body = body
+	t.tag = bytesEncoder(appendTagAndLength(t.scratch[:0], tagAndLength{
+		class:      cv.Class,
+		tag:        cv.Tag,
+		length:     body.Len(),
+		isCompound: true,
+	}))
+	return t, nil
+}
+
 func makeField(v reflect.Value, params fieldParameters) (e encoder, err error) {
 	if !v.IsValid() {
 		return nil, fmt.Errorf("asn1: cannot marshal nil value")
 	}
 	// If the field is an interface{} then recurse into it.
-	//  v.Kind() == reflect.Ptr maybe can add ptr
 	if v.Kind() == reflect.Interface && v.Type().NumMethod() == 0 {
 		return makeField(v.Elem(), params)
 	}
 
-	if v.Kind() == reflect.Slice && v.Len() == 0 && params.omitEmpty {
-		return bytesEncoder(nil), nil
+	// 扩展: 指针类型 — nil 指针在 omitEmpty 或 optional 时跳过，否则解引用
+	// 注意: *big.Int 由标准库直接处理 (bigIntType)，不在这里拦截
+	if v.Kind() == reflect.Pointer && v.Type() != bigIntType {
+		if v.IsNil() {
+			if params.omitEmpty || params.optional {
+				return bytesEncoder(nil), nil
+			}
+			return nil, fmt.Errorf("asn1: cannot marshal nil pointer")
+		}
+		return makeField(v.Elem(), params)
+	}
+
+	// 扩展: omitEmpty 支持 slice (含 []byte)、string、int 零值
+	if params.omitEmpty {
+		switch v.Kind() {
+		case reflect.Slice:
+			if v.Len() == 0 {
+				return bytesEncoder(nil), nil
+			}
+		case reflect.String:
+			if v.Len() == 0 {
+				return bytesEncoder(nil), nil
+			}
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			if v.Int() == 0 {
+				return bytesEncoder(nil), nil
+			}
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			if v.Uint() == 0 {
+				return bytesEncoder(nil), nil
+			}
+		}
 	}
 
 	if params.optional && params.defaultValue != nil && canHaveDefaultValue(v.Kind()) {
@@ -610,6 +727,22 @@ func makeField(v reflect.Value, params fieldParameters) (e encoder, err error) {
 		t.body = bytesEncoder(rv.Bytes)
 
 		return t, nil
+	}
+
+	// CompoundValue: marshal back with original class/tag structure
+	if v.Type() == compoundValueType {
+		cv := v.Interface().(CompoundValue)
+		return makeCompoundValue(cv, params)
+	}
+	if v.Type() == compoundValuePtrType {
+		cvp := v.Interface().(*CompoundValue)
+		if cvp == nil {
+			if params.omitEmpty || params.optional {
+				return bytesEncoder(nil), nil
+			}
+			return nil, fmt.Errorf("asn1: cannot marshal nil *CompoundValue")
+		}
+		return makeCompoundValue(*cvp, params)
 	}
 
 	matchAny, tag, isCompound, ok := getUniversalType(v.Type())
@@ -656,6 +789,16 @@ func makeField(v reflect.Value, params fieldParameters) (e encoder, err error) {
 		tag = TagSet
 	}
 
+	// BIT STRING encoding: wrap body with 0x00 padding byte,
+	// encode as BIT STRING (tag 0x03) instead of OCTET STRING/SEQUENCE.
+	if params.bitString {
+		if tag != TagOctetString && tag != TagSequence {
+			return nil, StructuralError{"bitstring tag on non-bytes/struct field"}
+		}
+		tag = TagBitString
+		isCompound = false
+	}
+
 	// makeField can be called for a slice that should be treated as a SET
 	// but doesn't have params.set set, for instance when using a slice
 	// with the SET type name suffix. In this case getUniversalType returns
@@ -670,6 +813,11 @@ func makeField(v reflect.Value, params fieldParameters) (e encoder, err error) {
 	t.body, err = makeBody(v, params)
 	if err != nil {
 		return nil, err
+	}
+
+	// BIT STRING: prepend 0x00 padding byte to body
+	if params.bitString {
+		t.body = multiEncoder([]encoder{byte00Encoder, t.body})
 	}
 
 	bodyLen := t.body.Len()
@@ -719,6 +867,7 @@ func makeField(v reflect.Value, params fieldParameters) (e encoder, err error) {
 //	omitempty:   causes empty slices to be skipped
 //	printable:   causes strings to be marshaled as ASN.1, PrintableString values
 //	utf8:        causes strings to be marshaled as ASN.1, UTF8String values
+//	numeric:     causes strings to be marshaled as ASN.1, NumericString values
 //	utc:         causes time.Time to be marshaled as ASN.1, UTCTime values
 //	generalized: causes time.Time to be marshaled as ASN.1, GeneralizedTime values
 func Marshal(val any) ([]byte, error) {

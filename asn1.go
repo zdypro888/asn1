@@ -113,6 +113,37 @@ func parseInt64(bytes []byte) (ret int64, err error) {
 	return
 }
 
+// parseUint64 treats the given bytes as a big-endian, unsigned integer and
+// returns the result.
+func parseUint64(bytes []byte) (ret uint64, err error) {
+	err = checkInteger(bytes)
+	if err != nil {
+		return
+	}
+	// ASN.1 INTEGER 是有符号的，无符号大值会有前导 0x00 字节
+	// 去掉前导 0x00 后最多 8 字节
+	if len(bytes) > 9 {
+		err = StructuralError{"integer too large for uint64"}
+		return
+	}
+	if len(bytes) == 9 {
+		if bytes[0] != 0 {
+			err = StructuralError{"integer too large for uint64"}
+			return
+		}
+		bytes = bytes[1:]
+	}
+	if len(bytes) > 0 && bytes[0]&0x80 != 0 && len(bytes) == 8 {
+		// 负数不能存入 uint64 — 但 8 字节最高位为 1 在无符号语义下是合法的
+		// ASN.1 中这被视为负数，但我们按无符号解释
+	}
+	for _, b := range bytes {
+		ret <<= 8
+		ret |= uint64(b)
+	}
+	return
+}
+
 // parseInt32 treats the given bytes as a big-endian, signed integer and returns
 // the result.
 func parseInt32(bytes []byte) (int32, error) {
@@ -463,7 +494,21 @@ func parseIA5String(bytes []byte) (ret string, err error) {
 // parseT61String parses an ASN.1 T61String (8-bit clean string) from the given
 // byte slice and returns it.
 func parseT61String(bytes []byte) (ret string, err error) {
-	return string(bytes), nil
+	// T.61 is a defunct ITU 8-bit character encoding which preceded Unicode.
+	// T.61 uses a code page layout that _almost_ exactly maps to the code
+	// page layout of the ISO 8859-1 (Latin-1) character encoding, with the
+	// exception that a number of characters in Latin-1 are not present
+	// in T.61.
+	//
+	// Instead of mapping which characters are present in Latin-1 but not T.61,
+	// we just treat these strings as being encoded using Latin-1. This matches
+	// what most of the world does, including BoringSSL.
+	buf := make([]byte, 0, len(bytes))
+	for _, v := range bytes {
+		// All the 1-byte UTF-8 runes map 1-1 with Latin-1.
+		buf = utf8.AppendRune(buf, rune(v))
+	}
+	return string(buf), nil
 }
 
 // UTF8String
@@ -482,8 +527,16 @@ func parseUTF8String(bytes []byte) (ret string, err error) {
 // parseBMPString parses an ASN.1 BMPString (Basic Multilingual Plane of
 // ISO/IEC/ITU 10646-1) from the given byte slice and returns it.
 func parseBMPString(bmpString []byte) (string, error) {
+	// BMPString uses the defunct UCS-2 16-bit character encoding, which
+	// covers the Basic Multilingual Plane (BMP). UTF-16 was an extension of
+	// UCS-2, containing all of the same code points, but also including
+	// multi-code point characters (by using surrogate code points). We can
+	// treat a UCS-2 encoded string as a UTF-16 encoded string, as long as
+	// we reject out the UTF-16 specific code points. This matches the
+	// BoringSSL behavior.
+
 	if len(bmpString)%2 != 0 {
-		return "", errors.New("pkcs12: odd-length BMP string")
+		return "", errors.New("invalid BMPString")
 	}
 
 	// Strip terminator if present.
@@ -493,7 +546,16 @@ func parseBMPString(bmpString []byte) (string, error) {
 
 	s := make([]uint16, 0, len(bmpString)/2)
 	for len(bmpString) > 0 {
-		s = append(s, uint16(bmpString[0])<<8+uint16(bmpString[1]))
+		point := uint16(bmpString[0])<<8 + uint16(bmpString[1])
+		// Reject UTF-16 code points that are permanently reserved
+		// noncharacters (0xfffe, 0xffff, and 0xfdd0-0xfdef) and surrogates
+		// (0xd800-0xdfff).
+		if point == 0xfffe || point == 0xffff ||
+			(point >= 0xfdd0 && point <= 0xfdef) ||
+			(point >= 0xd800 && point <= 0xdfff) {
+			return "", errors.New("invalid BMPString")
+		}
+		s = append(s, point)
 		bmpString = bmpString[2:]
 	}
 
@@ -635,10 +697,18 @@ func parseSequenceOf(bytes []byte, sliceType reflect.Type, elemType reflect.Type
 		offset += t.length
 		numElements++
 	}
-	ret = reflect.MakeSlice(sliceType, numElements, numElements)
+	elemSize := uint64(elemType.Size())
+	totalSize := elemSize * uint64(numElements)
+	// 限制最大分配 256MB，防止恶意输入
+	if totalSize > 256*1024*1024 {
+		err = SyntaxError{fmt.Sprintf("%s slice too big: %d elements of %d bytes", elemType.Kind(), numElements, elemSize)}
+		return
+	}
+	ret = reflect.MakeSlice(sliceType, 0, numElements)
 	params := fieldParameters{}
 	offset := 0
 	for i := 0; i < numElements; i++ {
+		ret = reflect.Append(ret, reflect.Zero(elemType))
 		offset, err = parseField(ret.Index(i), bytes, offset, params)
 		if err != nil {
 			return
@@ -656,12 +726,98 @@ var (
 	rawValueType         = reflect.TypeFor[RawValue]()
 	rawContentsType      = reflect.TypeFor[RawContent]()
 	bigIntType           = reflect.TypeFor[*big.Int]()
+	compoundValueType    = reflect.TypeFor[CompoundValue]()
+	compoundValuePtrType = reflect.TypeFor[*CompoundValue]()
 )
 
 // invalidLength reports whether offset + length > sliceLength, or if the
 // addition would overflow.
 func invalidLength(offset, length, sliceLength int) bool {
 	return offset+length < offset || offset+length > sliceLength
+}
+
+// CompoundValue 表示 ASN.1 复合类型 (SEQUENCE/SET/constructed context-specific)。
+// Class 和 Tag 保留原始标签信息，Items 是递归解析的子元素。
+type CompoundValue struct {
+	Class int
+	Tag   int
+	Items []any
+}
+
+// parseAnyElement 从 bytes[offset:] 解析一个 ASN.1 元素为 any 类型。
+// 原始类型解析为 Go 原生类型，复合类型递归解析为 CompoundValue。
+func parseAnyElement(bytes []byte, initOffset int) (result any, offset int, err error) {
+	offset = initOffset
+	if offset >= len(bytes) {
+		err = SyntaxError{"truncated any element"}
+		return
+	}
+	var t tagAndLength
+	t, offset, err = parseTagAndLength(bytes, offset)
+	if err != nil {
+		return
+	}
+	if invalidLength(offset, t.length, len(bytes)) {
+		err = SyntaxError{"data truncated"}
+		return
+	}
+	innerBytes := bytes[offset : offset+t.length]
+	offset += t.length
+
+	if t.isCompound {
+		result, err = parseCompoundAny(t, innerBytes)
+		return
+	}
+	if t.class == ClassUniversal {
+		switch t.tag {
+		case TagBoolean:
+			result, err = parseBool(innerBytes)
+		case TagPrintableString:
+			result, err = parsePrintableString(innerBytes)
+		case TagNumericString:
+			result, err = parseNumericString(innerBytes)
+		case TagIA5String:
+			result, err = parseIA5String(innerBytes)
+		case TagT61String:
+			result, err = parseT61String(innerBytes)
+		case TagUTF8String:
+			result, err = parseUTF8String(innerBytes)
+		case TagInteger:
+			result, err = parseInt64(innerBytes)
+		case TagBitString:
+			result, err = parseBitString(innerBytes)
+		case TagOID:
+			result, err = parseObjectIdentifier(innerBytes)
+		case TagUTCTime:
+			result, err = parseUTCTime(innerBytes)
+		case TagGeneralizedTime:
+			result, err = parseGeneralizedTime(innerBytes)
+		case TagOctetString:
+			result = append([]byte(nil), innerBytes...)
+		case TagBMPString:
+			result, err = parseBMPString(innerBytes)
+		default:
+			result = RawValue{t.class, t.tag, t.isCompound, append([]byte(nil), innerBytes...), append([]byte(nil), bytes[initOffset:offset]...)}
+		}
+	} else {
+		result = RawValue{t.class, t.tag, t.isCompound, append([]byte(nil), innerBytes...), append([]byte(nil), bytes[initOffset:offset]...)}
+	}
+	return
+}
+
+// parseCompoundAny 递归解析复合类型 (SEQUENCE/SET/constructed) 内部的所有子元素为 []any。
+func parseCompoundAny(t tagAndLength, innerBytes []byte) (*CompoundValue, error) {
+	var items []any
+	pos := 0
+	for pos < len(innerBytes) {
+		elem, newPos, err := parseAnyElement(innerBytes, pos)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, elem)
+		pos = newPos
+	}
+	return &CompoundValue{Class: t.class, Tag: t.tag, Items: items}, nil
 }
 
 // parseField is the main parsing function. Given a byte slice and an offset
@@ -679,6 +835,44 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 		return
 	}
 
+	// 扩展: 指针类型 — 分配新值然后解析内部元素。
+	// 如果 tag 不匹配 (optional), 指针保持 nil。
+	if fieldType.Kind() == reflect.Pointer && fieldType != bigIntType {
+		// 先探测 tag 是否匹配
+		if params.optional || params.omitEmpty {
+			// 检查当前 tag 是否与预期匹配
+			t, _, parseErr := parseTagAndLength(bytes, offset)
+			if parseErr != nil {
+				return offset, parseErr
+			}
+			expectedClass := ClassUniversal
+			expectedTag := 0
+			if params.tag != nil {
+				expectedClass = ClassContextSpecific
+				if params.application {
+					expectedClass = ClassApplication
+				} else if params.private {
+					expectedClass = ClassPrivate
+				}
+				expectedTag = *params.tag
+			} else {
+				_, expectedTag, _, _ = getUniversalType(fieldType.Elem())
+			}
+			if t.class != expectedClass || t.tag != expectedTag {
+				// tag 不匹配，跳过此字段 (保持 nil)
+				return offset, nil
+			}
+		}
+		// 分配新值
+		elem := reflect.New(fieldType.Elem())
+		offset, err = parseField(elem.Elem(), bytes, offset, params)
+		if err != nil {
+			return
+		}
+		v.Set(elem)
+		return
+	}
+
 	// Deal with the ANY type.
 	if ifaceType := fieldType; ifaceType.Kind() == reflect.Interface && ifaceType.NumMethod() == 0 {
 		var t tagAndLength
@@ -691,8 +885,8 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 			return
 		}
 		var result any
+		innerBytes := bytes[offset : offset+t.length]
 		if !t.isCompound && t.class == ClassUniversal {
-			innerBytes := bytes[offset : offset+t.length]
 			switch t.tag {
 			case TagBoolean:
 				result, err = parseBool(innerBytes)
@@ -717,12 +911,20 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 			case TagGeneralizedTime:
 				result, err = parseGeneralizedTime(innerBytes)
 			case TagOctetString:
-				result = innerBytes
+				result = append([]byte(nil), innerBytes...)
 			case TagBMPString:
 				result, err = parseBMPString(innerBytes)
 			default:
-				// If we don't know how to handle the type, we just leave Value as nil.
+				// Unknown primitive: preserve as RawValue
+				result = RawValue{t.class, t.tag, t.isCompound, append([]byte(nil), innerBytes...), append([]byte(nil), bytes[initOffset:offset+t.length]...)}
 			}
+		} else if t.isCompound {
+			// Compound type (SEQUENCE, SET, or context-specific constructed):
+			// recursively parse each child element as any.
+			result, err = parseCompoundAny(t, innerBytes)
+		} else {
+			// Non-universal, non-compound: preserve as RawValue
+			result = RawValue{t.class, t.tag, t.isCompound, append([]byte(nil), innerBytes...), append([]byte(nil), bytes[initOffset:offset+t.length]...)}
 		}
 		offset += t.length
 		if err != nil {
@@ -747,10 +949,23 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 			err = StructuralError{"explicit tag has no child"}
 			return
 		}
-		if t.class == expectedClass && (t.tag == *params.tag || *params.tag == -1) && (t.length == 0 || t.isCompound) {
+		if t.class == expectedClass && t.tag == *params.tag && (t.length == 0 || t.isCompound) {
 			if fieldType == rawValueType {
 				// The inner element should not be parsed for RawValues.
 			} else if t.length > 0 {
+				// 对于 []byte 字段: 先 peek 内层标签，如果不是 OCTET STRING，
+				// 则直接捕获内层全部原始字节 (内层可能是 SEQUENCE 等任意类型)
+				if fieldType.Kind() == reflect.Slice && fieldType.Elem().Kind() == reflect.Uint8 {
+					innerTag, _, peekErr := parseTagAndLength(bytes, offset)
+					if peekErr == nil && !(innerTag.class == ClassUniversal && innerTag.tag == TagOctetString) {
+						// 内层不是 OCTET STRING，直接捕获全部原始字节
+						innerBytes := bytes[offset : offset+t.length]
+						offset += t.length
+						v.Set(reflect.MakeSlice(fieldType, len(innerBytes), len(innerBytes)))
+						reflect.Copy(v, reflect.ValueOf(innerBytes))
+						return
+					}
+				}
 				t, offset, err = parseTagAndLength(bytes, offset)
 				if err != nil {
 					return
@@ -797,9 +1012,18 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 	}
 
 	// Special case for time: UTCTime and GeneralizedTime both map to the
-	// Go type time.Time.
-	if universalTag == TagUTCTime && t.tag == TagGeneralizedTime && t.class == ClassUniversal {
-		universalTag = TagGeneralizedTime
+	// Go type time.Time. getUniversalType returns the tag for UTCTime when
+	// it sees a time.Time, so if we see a different time type on the wire,
+	// or the field is tagged with a different type, we change the universal
+	// type to match.
+	if universalTag == TagUTCTime {
+		if t.class == ClassUniversal {
+			if t.tag == TagGeneralizedTime {
+				universalTag = t.tag
+			}
+		} else if params.timeType != 0 {
+			universalTag = params.timeType
+		}
 	}
 
 	if params.set {
@@ -828,9 +1052,14 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 		matchAnyClassAndTag = false
 	}
 
+	// BIT STRING tag support: when field has `asn1:"bitstring"` tag,
+	// accept BIT STRING (tag 0x03) for []byte or struct fields.
+	// Standard in X.509 for SubjectPublicKeyInfo and signature values.
+	bitStringWrapped := params.bitString && t.class == ClassUniversal && t.tag == TagBitString
+
 	// We have unwrapped any explicit tagging at this point.
-	if !matchAnyClassAndTag && (t.class != expectedClass || t.tag != expectedTag) ||
-		(!matchAny && t.isCompound != compoundType) {
+	if !matchAnyClassAndTag && (t.class != expectedClass || t.tag != expectedTag) && !bitStringWrapped ||
+		(!matchAny && t.isCompound != compoundType && !bitStringWrapped) {
 		// Tags don't match. Again, it could be an optional element.
 		ok := setDefaultValue(v, params)
 		if ok {
@@ -846,6 +1075,15 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 	}
 	innerBytes := bytes[offset : offset+t.length]
 	offset += t.length
+
+	// Strip BIT STRING padding byte (0x00) to get the content bytes
+	if bitStringWrapped {
+		if len(innerBytes) < 1 || innerBytes[0] != 0 {
+			err = StructuralError{"BIT STRING with non-zero padding cannot be parsed as bytes/struct"}
+			return
+		}
+		innerBytes = innerBytes[1:]
+	}
 
 	// We deal with the structures defined in this package first.
 	switch v := v.Addr().Interface().(type) {
@@ -906,23 +1144,46 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 			err = err1
 		}
 		return
-	// TODO(dfc) Add support for the remaining integer types
+	case reflect.Uint, reflect.Uint32, reflect.Uint64:
+		parsedUint, err1 := parseUint64(innerBytes)
+		if err1 == nil {
+			val.SetUint(parsedUint)
+		}
+		err = err1
+		return
 	case reflect.Struct:
 		structType := fieldType
+
+		if structType.NumField() > 0 &&
+			structType.Field(0).Type == rawContentsType {
+			bytes := bytes[initOffset:offset]
+			val.Field(0).Set(reflect.ValueOf(RawContent(bytes)))
+		}
 
 		innerOffset := 0
 		for i := 0; i < structType.NumField(); i++ {
 			field := structType.Field(i)
-			fieldParams := parseFieldParameters(field.Tag.Get("asn1"))
-			if !field.IsExported() || fieldParams.skip {
+			if i == 0 && field.Type == rawContentsType {
 				continue
 			}
-			if innerOffset == 0 && field.Type == rawContentsType {
-				bytes := bytes[initOffset:offset]
-				val.Field(0).Set(reflect.ValueOf(RawContent(bytes)))
+			// 跳过非导出字段
+			if !field.IsExported() {
 				continue
 			}
-			innerOffset, err = parseField(val.Field(i), innerBytes, innerOffset, fieldParams)
+			fp := parseFieldParameters(field.Tag.Get("asn1"))
+			// asn1:"-" 跳过此字段
+			if fp.skip {
+				continue
+			}
+			// 匿名 struct 字段 (inline): 展平解析其子字段
+			if field.Anonymous && field.Type.Kind() == reflect.Struct {
+				innerOffset, err = parseInlineStruct(val.Field(i), innerBytes, innerOffset)
+				if err != nil {
+					return
+				}
+				continue
+			}
+			innerOffset, err = parseField(val.Field(i), innerBytes, innerOffset, fp)
 			if err != nil {
 				return
 			}
@@ -978,6 +1239,36 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 	return
 }
 
+// parseInlineStruct 展平解析嵌入 struct 的子字段，不消费外层 SEQUENCE 包装。
+// 用于匿名 (inline) struct 字段，其子字段直接作为父 SEQUENCE 的一部分。
+func parseInlineStruct(v reflect.Value, bytes []byte, offset int) (int, error) {
+	structType := v.Type()
+	for i := 0; i < structType.NumField(); i++ {
+		field := structType.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		fp := parseFieldParameters(field.Tag.Get("asn1"))
+		if fp.skip {
+			continue
+		}
+		if field.Anonymous && field.Type.Kind() == reflect.Struct {
+			var err error
+			offset, err = parseInlineStruct(v.Field(i), bytes, offset)
+			if err != nil {
+				return offset, err
+			}
+			continue
+		}
+		var err error
+		offset, err = parseField(v.Field(i), bytes, offset, fp)
+		if err != nil {
+			return offset, err
+		}
+	}
+	return offset, nil
+}
+
 // canHaveDefaultValue reports whether k is a Kind that we will set a default
 // value for. (A signed integer, essentially.)
 func canHaveDefaultValue(k reflect.Kind) bool {
@@ -993,7 +1284,7 @@ func canHaveDefaultValue(k reflect.Kind) bool {
 // a Value. It is successful if the field was optional, even if a default value
 // wasn't provided or it failed to install it into the Value.
 func setDefaultValue(v reflect.Value, params fieldParameters) (ok bool) {
-	if !params.optional {
+	if !params.optional && !params.omitEmpty {
 		return
 	}
 	ok = true
@@ -1064,6 +1355,13 @@ func setDefaultValue(v reflect.Value, params fieldParameters) (ok bool) {
 //	ia5     causes strings to be unmarshaled as ASN.1 IA5String values
 //	numeric causes strings to be unmarshaled as ASN.1 NumericString values
 //	utf8    causes strings to be unmarshaled as ASN.1 UTF8String values
+//
+// When decoding an ASN.1 value with an IMPLICIT tag into a time.Time field,
+// Unmarshal will default to a UTCTime, which doesn't support time zones or
+// fractional seconds. To force usage of GeneralizedTime, use the following
+// tag:
+//
+//	generalized causes time.Times to be unmarshaled as ASN.1 GeneralizedTime values
 //
 // If the type of the first field of a structure is RawContent then the raw
 // ASN1 contents of the struct will be stored in it.

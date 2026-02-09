@@ -83,7 +83,8 @@ type fieldParameters struct {
 	timeType     int    // the time tag to use when marshaling.
 	set          bool   // true iff this should be encoded as a SET
 	omitEmpty    bool   // true iff this should be omitted if empty when marshaling.
-	skip         bool   // true iff this should be skipped when marshaling.
+	skip         bool   // true iff this field should be skipped (tag "-")
+	bitString    bool   // true iff this should be encoded/decoded as BIT STRING (for []byte/struct fields)
 
 	// Invariants:
 	//   if explicit is set, tag is non-nil.
@@ -93,6 +94,11 @@ type fieldParameters struct {
 // parseFieldParameters will parse it into a fieldParameters structure,
 // ignoring unknown parts of the string.
 func parseFieldParameters(str string) (ret fieldParameters) {
+	// "-" 表示跳过此字段
+	if str == "-" {
+		ret.skip = true
+		return
+	}
 	var part string
 	for len(str) > 0 {
 		part, str, _ = strings.Cut(str, ",")
@@ -123,15 +129,10 @@ func parseFieldParameters(str string) (ret fieldParameters) {
 				*ret.defaultValue = i
 			}
 		case strings.HasPrefix(part, "tag:"):
-			if part[4:] == "x" {
+			i, err := strconv.Atoi(part[4:])
+			if err == nil {
 				ret.tag = new(int)
-				*ret.tag = -1
-			} else {
-				i, err := strconv.Atoi(part[4:])
-				if err == nil {
-					ret.tag = new(int)
-					*ret.tag = i
-				}
+				*ret.tag = i
 			}
 		case part == "set":
 			ret.set = true
@@ -147,8 +148,8 @@ func parseFieldParameters(str string) (ret fieldParameters) {
 			}
 		case part == "omitempty":
 			ret.omitEmpty = true
-		case part == "-":
-			ret.skip = true
+		case part == "bitstring":
+			ret.bitString = true
 		}
 	}
 	return
@@ -176,6 +177,8 @@ func getUniversalType(t reflect.Type) (matchAny bool, tagNumber int, isCompound,
 		return false, TagBoolean, false, true
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return false, TagInteger, false, true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return false, TagInteger, false, true
 	case reflect.Struct:
 		return false, TagSequence, true, true
 	case reflect.Slice:
@@ -188,6 +191,9 @@ func getUniversalType(t reflect.Type) (matchAny bool, tagNumber int, isCompound,
 		return false, TagSequence, true, true
 	case reflect.String:
 		return false, TagPrintableString, false, true
+	case reflect.Pointer:
+		// 指针类型: 解引用后递归获取 universal type
+		return getUniversalType(t.Elem())
 	}
 	return false, 0, false, false
 }
