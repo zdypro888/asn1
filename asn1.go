@@ -884,6 +884,39 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 			err = SyntaxError{"data truncated"}
 			return
 		}
+		// Handle explicit tag for ANY type: validate outer tag matches before parsing inner content.
+		// Without this, ANY greedily consumes the first available element regardless of tag number.
+		if params.explicit && params.tag != nil {
+			expectedClass := ClassContextSpecific
+			if params.application {
+				expectedClass = ClassApplication
+			}
+			if t.class == expectedClass && t.tag == *params.tag && (t.length == 0 || t.isCompound) {
+				// Outer explicit tag matched — unwrap and re-parse inner tag
+				if t.length > 0 {
+					t, offset, err = parseTagAndLength(bytes, offset)
+					if err != nil {
+						return
+					}
+					if invalidLength(offset, t.length, len(bytes)) {
+						err = SyntaxError{"data truncated"}
+						return
+					}
+				} else {
+					// Zero-length explicit tag: set nil and return
+					return
+				}
+			} else {
+				// Tag didn't match — skip if optional
+				ok := setDefaultValue(v, params)
+				if ok {
+					offset = initOffset
+				} else {
+					err = StructuralError{"explicitly tagged member didn't match"}
+				}
+				return
+			}
+		}
 		var result any
 		innerBytes := bytes[offset : offset+t.length]
 		if !t.isCompound && t.class == ClassUniversal {
