@@ -660,6 +660,12 @@ func makeField(v reflect.Value, params fieldParameters) (e encoder, err error) {
 	}
 	// If the field is an interface{} then recurse into it.
 	if v.Kind() == reflect.Interface && v.Type().NumMethod() == 0 {
+		if v.IsNil() {
+			if params.omitEmpty || params.optional {
+				return bytesEncoder(nil), nil
+			}
+			return nil, fmt.Errorf("asn1: cannot marshal nil value")
+		}
 		return makeField(v.Elem(), params)
 	}
 
@@ -672,11 +678,16 @@ func makeField(v reflect.Value, params fieldParameters) (e encoder, err error) {
 			}
 			return nil, fmt.Errorf("asn1: cannot marshal nil pointer")
 		}
-		return makeField(v.Elem(), params)
+		// 指针非 nil 表示用户明确想编码该值（即使是零值），
+		// 设置 fromPointer 标记，让后续零值检查跳过
+		derefParams := params
+		derefParams.fromPointer = true
+		return makeField(v.Elem(), derefParams)
 	}
 
 	// 扩展: omitEmpty 支持 slice (含 []byte)、string、int 零值
-	if params.omitEmpty {
+	// fromPointer=true 时跳过: 非 nil 指针解引用后的值应始终编码
+	if params.omitEmpty && !params.fromPointer {
 		switch v.Kind() {
 		case reflect.Slice:
 			if v.Len() == 0 {
@@ -697,7 +708,7 @@ func makeField(v reflect.Value, params fieldParameters) (e encoder, err error) {
 		}
 	}
 
-	if params.optional && params.defaultValue != nil && canHaveDefaultValue(v.Kind()) {
+	if params.optional && !params.fromPointer && params.defaultValue != nil && canHaveDefaultValue(v.Kind()) {
 		defaultValue := reflect.New(v.Type()).Elem()
 		defaultValue.SetInt(*params.defaultValue)
 
@@ -709,7 +720,7 @@ func makeField(v reflect.Value, params fieldParameters) (e encoder, err error) {
 	// If no default value is given then the zero value for the type is
 	// assumed to be the default value. This isn't obviously the correct
 	// behavior, but it's what Go has traditionally done.
-	if params.optional && params.defaultValue == nil {
+	if params.optional && !params.fromPointer && params.defaultValue == nil {
 		if reflect.DeepEqual(v.Interface(), reflect.Zero(v.Type()).Interface()) {
 			return bytesEncoder(nil), nil
 		}

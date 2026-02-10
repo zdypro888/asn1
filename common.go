@@ -85,6 +85,7 @@ type fieldParameters struct {
 	omitEmpty    bool   // true iff this should be omitted if empty when marshaling.
 	skip         bool   // true iff this field should be skipped (tag "-")
 	bitString    bool   // true iff this should be encoded/decoded as BIT STRING (for []byte/struct fields)
+	fromPointer  bool   // true when value was dereferenced from a non-nil pointer (skip zero-value omission)
 
 	// Invariants:
 	//   if explicit is set, tag is non-nil.
