@@ -398,6 +398,71 @@ func TestSetEncoderSETSliceSuffix(t *testing.T) {
 	}
 }
 
+// TestCompoundValueExplicitTagRoundTrip 验证 CompoundValue 在 explicit tag 字段中的
+// marshal→unmarshal→re-marshal round-trip 保持字节一致。
+// 修复前: re-marshal 丢失 explicit [0] wrapper (a0 tag)，导致字节不一致。
+func TestCompoundValueExplicitTagRoundTrip(t *testing.T) {
+	type innerStruct struct {
+		OID   ObjectIdentifier
+		Value []byte
+	}
+	type outerStruct struct {
+		Field1 any `asn1:"optional,explicit,tag:0"`
+		Field2 int
+	}
+
+	// 1. 用 typed value 初始 marshal
+	inner := innerStruct{
+		OID:   ObjectIdentifier{1, 2, 42, 3},
+		Value: []byte{0xaa, 0xbb},
+	}
+	original := outerStruct{
+		Field1: inner,
+		Field2: 42,
+	}
+	originalBytes, err := Marshal(original)
+	if err != nil {
+		t.Fatalf("initial marshal: %v", err)
+	}
+
+	// 验证第一个字节 0x30 (outer SEQUENCE), 然后 0xa0 (explicit [0] wrapper)
+	if len(originalBytes) < 3 {
+		t.Fatalf("marshal too short: %d bytes", len(originalBytes))
+	}
+	// 找到 a0 tag: 跳过外层 SEQUENCE 的 tag+length
+	innerStart := 2 // 0x30 + 1 byte length for short form
+	if originalBytes[1]&0x80 != 0 {
+		innerStart = 2 + int(originalBytes[1]&0x7f) // long form
+	}
+	if originalBytes[innerStart] != 0xa0 {
+		t.Fatalf("expected explicit [0] tag (0xa0), got 0x%02x", originalBytes[innerStart])
+	}
+
+	// 2. Unmarshal 到 outerStruct (Field1 变成 *CompoundValue)
+	var parsed outerStruct
+	_, err = Unmarshal(originalBytes, &parsed)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// 验证 Field1 是 *CompoundValue
+	if _, ok := parsed.Field1.(*CompoundValue); !ok {
+		t.Fatalf("expected *CompoundValue, got %T", parsed.Field1)
+	}
+
+	// 3. Re-marshal 并比较
+	remarshaledBytes, err := Marshal(parsed)
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+
+	if !bytes.Equal(originalBytes, remarshaledBytes) {
+		t.Errorf("round-trip mismatch:\n  original:    %s\n  re-marshaled: %s",
+			hex.EncodeToString(originalBytes),
+			hex.EncodeToString(remarshaledBytes))
+	}
+}
+
 func BenchmarkUnmarshal(b *testing.B) {
 	b.ReportAllocs()
 

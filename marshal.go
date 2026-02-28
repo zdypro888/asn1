@@ -624,6 +624,7 @@ func makeBody(value reflect.Value, params fieldParameters) (e encoder, err error
 
 // makeCompoundValue 将 CompoundValue 编码为带 tag 的 DER 结构。
 // 递归处理 Items 中的每个子元素。
+// 如果 params 指定了 explicit tag，则在 CompoundValue 自身编码外面再包一层。
 func makeCompoundValue(cv CompoundValue, params fieldParameters) (encoder, error) {
 	var body encoder
 	if len(cv.Items) == 0 {
@@ -651,6 +652,26 @@ func makeCompoundValue(cv CompoundValue, params fieldParameters) (encoder, error
 		length:     body.Len(),
 		isCompound: true,
 	}))
+
+	// 如果 struct field 指定了 explicit tag，需要在 CompoundValue 编码外面再包一层
+	if params.tag != nil && params.explicit {
+		class := ClassContextSpecific
+		if params.application {
+			class = ClassApplication
+		} else if params.private {
+			class = ClassPrivate
+		}
+		tt := new(taggedEncoder)
+		tt.body = t
+		tt.tag = bytesEncoder(appendTagAndLength(tt.scratch[:0], tagAndLength{
+			class:      class,
+			tag:        *params.tag,
+			length:     t.body.Len() + t.tag.Len(),
+			isCompound: true,
+		}))
+		return tt, nil
+	}
+
 	return t, nil
 }
 
