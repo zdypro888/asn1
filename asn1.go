@@ -25,6 +25,7 @@ import (
 	"math"
 	"math/big"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -120,6 +121,11 @@ func parseUint64(bytes []byte) (ret uint64, err error) {
 	if err != nil {
 		return
 	}
+	// Previously negative DER integers were reinterpreted as unsigned (e.g.
+	// -1 became 255). Reject the sign before removing a positive padding byte.
+	if bytes[0]&0x80 != 0 {
+		return 0, StructuralError{"negative integer cannot be stored in uint64"}
+	}
 	// ASN.1 INTEGER 是有符号的，无符号大值会有前导 0x00 字节
 	// 去掉前导 0x00 后最多 8 字节
 	if len(bytes) > 9 {
@@ -132,10 +138,6 @@ func parseUint64(bytes []byte) (ret uint64, err error) {
 			return
 		}
 		bytes = bytes[1:]
-	}
-	if len(bytes) > 0 && bytes[0]&0x80 != 0 && len(bytes) == 8 {
-		// 负数不能存入 uint64 — 但 8 字节最高位为 1 在无符号语义下是合法的
-		// ASN.1 中这被视为负数，但我们按无符号解释
 	}
 	for _, b := range bytes {
 		ret <<= 8
@@ -659,7 +661,7 @@ func parseTagAndLength(bytes []byte, initOffset int) (ret tagAndLength, offset i
 // parseSequenceOf is used for SEQUENCE OF and SET OF values. It tries to parse
 // a number of ASN.1 values from the given byte slice and returns them as a
 // slice of Go values of the given type.
-func parseSequenceOf(bytes []byte, sliceType reflect.Type, elemType reflect.Type) (ret reflect.Value, err error) {
+func parseSequenceOf(bytes []byte, sliceType reflect.Type, elemType reflect.Type, depth int) (ret reflect.Value, err error) {
 	matchAny, expectedTag, compoundType, ok := getUniversalType(elemType)
 	if !ok {
 		err = StructuralError{"unknown Go type for slice"}
@@ -698,9 +700,9 @@ func parseSequenceOf(bytes []byte, sliceType reflect.Type, elemType reflect.Type
 		numElements++
 	}
 	elemSize := uint64(elemType.Size())
-	totalSize := elemSize * uint64(numElements)
 	// 限制最大分配 256MB，防止恶意输入
-	if totalSize > 256*1024*1024 {
+	// Divide before multiplying: the former size product could wrap.
+	if elemSize != 0 && uint64(numElements) > 256*1024*1024/elemSize {
 		err = SyntaxError{fmt.Sprintf("%s slice too big: %d elements of %d bytes", elemType.Kind(), numElements, elemSize)}
 		return
 	}
@@ -709,7 +711,7 @@ func parseSequenceOf(bytes []byte, sliceType reflect.Type, elemType reflect.Type
 	offset := 0
 	for i := 0; i < numElements; i++ {
 		ret = reflect.Append(ret, reflect.Zero(elemType))
-		offset, err = parseField(ret.Index(i), bytes, offset, params)
+		offset, err = parseField(ret.Index(i), bytes, offset, params, depth)
 		if err != nil {
 			return
 		}
@@ -746,7 +748,11 @@ type CompoundValue struct {
 
 // parseAnyElement 从 bytes[offset:] 解析一个 ASN.1 元素为 any 类型。
 // 原始类型解析为 Go 原生类型，复合类型递归解析为 CompoundValue。
-func parseAnyElement(bytes []byte, initOffset int) (result any, offset int, err error) {
+func parseAnyElement(bytes []byte, initOffset int, depth int) (result any, offset int, err error) {
+	depth++
+	if decodeDepthExceeded(depth) {
+		return nil, initOffset, StructuralError{"nesting depth exceeded"}
+	}
 	offset = initOffset
 	if offset >= len(bytes) {
 		err = SyntaxError{"truncated any element"}
@@ -765,7 +771,7 @@ func parseAnyElement(bytes []byte, initOffset int) (result any, offset int, err 
 	offset += t.length
 
 	if t.isCompound {
-		result, err = parseCompoundAny(t, innerBytes)
+		result, err = parseCompoundAny(t, innerBytes, depth)
 		return
 	}
 	if t.class == ClassUniversal {
@@ -806,11 +812,11 @@ func parseAnyElement(bytes []byte, initOffset int) (result any, offset int, err 
 }
 
 // parseCompoundAny 递归解析复合类型 (SEQUENCE/SET/constructed) 内部的所有子元素为 []any。
-func parseCompoundAny(t tagAndLength, innerBytes []byte) (*CompoundValue, error) {
+func parseCompoundAny(t tagAndLength, innerBytes []byte, depth int) (*CompoundValue, error) {
 	var items []any
 	pos := 0
 	for pos < len(innerBytes) {
-		elem, newPos, err := parseAnyElement(innerBytes, pos)
+		elem, newPos, err := parseAnyElement(innerBytes, pos, depth)
 		if err != nil {
 			return nil, err
 		}
@@ -823,7 +829,17 @@ func parseCompoundAny(t tagAndLength, innerBytes []byte) (*CompoundValue, error)
 // parseField is the main parsing function. Given a byte slice and an offset
 // into the array, it will try to parse a suitable ASN.1 value out and store it
 // in the given Value.
-func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParameters) (offset int, err error) {
+// The fork previously dropped encoding/asn1's recursion budget. Apply the
+// same limit to typed fields AND the additional CompoundValue/ANY parser.
+func decodeDepthExceeded(depth int) bool {
+	return depth > 10000 || runtime.GOARCH == "wasm" && depth > 5000
+}
+
+func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParameters, depth int) (offset int, err error) {
+	depth++
+	if decodeDepthExceeded(depth) {
+		return initOffset, StructuralError{"nesting depth exceeded"}
+	}
 	offset = initOffset
 	fieldType := v.Type()
 
@@ -838,38 +854,16 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 	// 扩展: 指针类型 — 分配新值然后解析内部元素。
 	// 如果 tag 不匹配 (optional), 指针保持 nil。
 	if fieldType.Kind() == reflect.Pointer && fieldType != bigIntType {
-		// 先探测 tag 是否匹配
-		if params.optional || params.omitEmpty {
-			// 检查当前 tag 是否与预期匹配
-			t, _, parseErr := parseTagAndLength(bytes, offset)
-			if parseErr != nil {
-				return offset, parseErr
-			}
-			expectedClass := ClassUniversal
-			expectedTag := 0
-			if params.tag != nil {
-				expectedClass = ClassContextSpecific
-				if params.application {
-					expectedClass = ClassApplication
-				} else if params.private {
-					expectedClass = ClassPrivate
-				}
-				expectedTag = *params.tag
-			} else {
-				_, expectedTag, _, _ = getUniversalType(fieldType.Elem())
-			}
-			if t.class != expectedClass || t.tag != expectedTag {
-				// tag 不匹配，跳过此字段 (保持 nil)
-				return offset, nil
-			}
-		}
-		// 分配新值
+		// Let the full field parser match tags. The former simplified probe
+		// rejected valid optional UTF8 strings, generalized times and RawValues.
 		elem := reflect.New(fieldType.Elem())
-		offset, err = parseField(elem.Elem(), bytes, offset, params)
+		offset, err = parseField(elem.Elem(), bytes, offset, params, depth)
 		if err != nil {
 			return
 		}
-		v.Set(elem)
+		if offset != initOffset {
+			v.Set(elem)
+		}
 		return
 	}
 
@@ -890,16 +884,26 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 			expectedClass := ClassContextSpecific
 			if params.application {
 				expectedClass = ClassApplication
+			} else if params.private {
+				expectedClass = ClassPrivate
 			}
 			if t.class == expectedClass && t.tag == *params.tag && (t.length == 0 || t.isCompound) {
 				// Outer explicit tag matched — unwrap and re-parse inner tag
 				if t.length > 0 {
+					// The outer TLV, not its enclosing SEQUENCE, bounds the
+					// inner value. Previously sibling bytes could satisfy it.
+					explicitEnd := offset + t.length
+					bytes = bytes[:explicitEnd]
 					t, offset, err = parseTagAndLength(bytes, offset)
 					if err != nil {
 						return
 					}
 					if invalidLength(offset, t.length, len(bytes)) {
 						err = SyntaxError{"data truncated"}
+						return
+					}
+					if offset+t.length != explicitEnd {
+						err = StructuralError{"explicit tag contains trailing data"}
 						return
 					}
 				} else {
@@ -954,7 +958,7 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 		} else if t.isCompound {
 			// Compound type (SEQUENCE, SET, or context-specific constructed):
 			// recursively parse each child element as any.
-			result, err = parseCompoundAny(t, innerBytes)
+			result, err = parseCompoundAny(t, innerBytes, depth)
 		} else {
 			// Non-universal, non-compound: preserve as RawValue
 			result = RawValue{t.class, t.tag, t.isCompound, append([]byte(nil), innerBytes...), append([]byte(nil), bytes[initOffset:offset+t.length]...)}
@@ -977,20 +981,35 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 		expectedClass := ClassContextSpecific
 		if params.application {
 			expectedClass = ClassApplication
+		} else if params.private {
+			expectedClass = ClassPrivate
 		}
 		if offset == len(bytes) {
 			err = StructuralError{"explicit tag has no child"}
 			return
 		}
 		if t.class == expectedClass && t.tag == *params.tag && (t.length == 0 || t.isCompound) {
+			// Bound the wrapper before the raw []byte fast path slices it.
+			// Previously a truncated explicit tag could panic or read a sibling.
+			if invalidLength(offset, t.length, len(bytes)) {
+				return offset, SyntaxError{"data truncated"}
+			}
+			explicitEnd := offset + t.length
+			bytes = bytes[:explicitEnd]
 			if fieldType == rawValueType {
 				// The inner element should not be parsed for RawValues.
 			} else if t.length > 0 {
 				// 对于 []byte 字段: 先 peek 内层标签，如果不是 OCTET STRING，
 				// 则直接捕获内层全部原始字节 (内层可能是 SEQUENCE 等任意类型)
 				if fieldType.Kind() == reflect.Slice && fieldType.Elem().Kind() == reflect.Uint8 {
-					innerTag, _, peekErr := parseTagAndLength(bytes, offset)
-					if peekErr == nil && !(innerTag.class == ClassUniversal && innerTag.tag == TagOctetString) {
+					innerTag, innerOffset, peekErr := parseTagAndLength(bytes, offset)
+					if peekErr != nil {
+						return offset, peekErr
+					}
+					if invalidLength(innerOffset, innerTag.length, explicitEnd) || innerOffset+innerTag.length != explicitEnd {
+						return offset, StructuralError{"explicit tag must contain one complete value"}
+					}
+					if !(innerTag.class == ClassUniversal && innerTag.tag == TagOctetString) {
 						// 内层不是 OCTET STRING，直接捕获全部原始字节
 						innerBytes := bytes[offset : offset+t.length]
 						offset += t.length
@@ -1002,6 +1021,9 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 				t, offset, err = parseTagAndLength(bytes, offset)
 				if err != nil {
 					return
+				}
+				if invalidLength(offset, t.length, explicitEnd) || offset+t.length != explicitEnd {
+					return offset, StructuralError{"explicit tag must contain one complete value"}
 				}
 			} else {
 				if fieldType != flagType {
@@ -1162,23 +1184,22 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 		}
 		err = err1
 		return
-	case reflect.Int, reflect.Int32, reflect.Int64:
-		if val.Type().Size() == 4 {
-			parsedInt, err1 := parseInt32(innerBytes)
-			if err1 == nil {
-				val.SetInt(int64(parsedInt))
-			}
-			err = err1
-		} else {
-			parsedInt, err1 := parseInt64(innerBytes)
-			if err1 == nil {
-				val.SetInt(parsedInt)
-			}
-			err = err1
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		parsedInt, err1 := parseInt64(innerBytes)
+		if err1 == nil && val.OverflowInt(parsedInt) {
+			err1 = StructuralError{"integer too large for " + val.Type().String()}
 		}
+		if err1 == nil {
+			val.SetInt(parsedInt)
+		}
+		err = err1
 		return
-	case reflect.Uint, reflect.Uint32, reflect.Uint64:
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		parsedUint, err1 := parseUint64(innerBytes)
+		// SetUint silently truncated uint32; validate before publishing.
+		if err1 == nil && val.OverflowUint(parsedUint) {
+			err1 = StructuralError{"integer too large for " + val.Type().String()}
+		}
 		if err1 == nil {
 			val.SetUint(parsedUint)
 		}
@@ -1210,13 +1231,13 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 			}
 			// 匿名 struct 字段 (inline): 展平解析其子字段
 			if field.Anonymous && field.Type.Kind() == reflect.Struct {
-				innerOffset, err = parseInlineStruct(val.Field(i), innerBytes, innerOffset)
+				innerOffset, err = parseInlineStruct(val.Field(i), innerBytes, innerOffset, depth)
 				if err != nil {
 					return
 				}
 				continue
 			}
-			innerOffset, err = parseField(val.Field(i), innerBytes, innerOffset, fp)
+			innerOffset, err = parseField(val.Field(i), innerBytes, innerOffset, fp, depth)
 			if err != nil {
 				return
 			}
@@ -1232,7 +1253,7 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 			reflect.Copy(val, reflect.ValueOf(innerBytes))
 			return
 		}
-		newSlice, err1 := parseSequenceOf(innerBytes, sliceType, sliceType.Elem())
+		newSlice, err1 := parseSequenceOf(innerBytes, sliceType, sliceType.Elem(), depth)
 		if err1 == nil {
 			val.Set(newSlice)
 		}
@@ -1274,7 +1295,11 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 
 // parseInlineStruct 展平解析嵌入 struct 的子字段，不消费外层 SEQUENCE 包装。
 // 用于匿名 (inline) struct 字段，其子字段直接作为父 SEQUENCE 的一部分。
-func parseInlineStruct(v reflect.Value, bytes []byte, offset int) (int, error) {
+func parseInlineStruct(v reflect.Value, bytes []byte, offset int, depth int) (int, error) {
+	depth++
+	if decodeDepthExceeded(depth) {
+		return offset, StructuralError{"nesting depth exceeded"}
+	}
 	structType := v.Type()
 	for i := 0; i < structType.NumField(); i++ {
 		field := structType.Field(i)
@@ -1287,14 +1312,14 @@ func parseInlineStruct(v reflect.Value, bytes []byte, offset int) (int, error) {
 		}
 		if field.Anonymous && field.Type.Kind() == reflect.Struct {
 			var err error
-			offset, err = parseInlineStruct(v.Field(i), bytes, offset)
+			offset, err = parseInlineStruct(v.Field(i), bytes, offset, depth)
 			if err != nil {
 				return offset, err
 			}
 			continue
 		}
 		var err error
-		offset, err = parseField(v.Field(i), bytes, offset, fp)
+		offset, err = parseField(v.Field(i), bytes, offset, fp, depth)
 		if err != nil {
 			return offset, err
 		}
@@ -1434,7 +1459,7 @@ func UnmarshalWithParams(b []byte, val any, params string) (rest []byte, err err
 	if v.Kind() != reflect.Pointer || v.IsNil() {
 		return nil, &invalidUnmarshalError{reflect.TypeOf(val)}
 	}
-	offset, err := parseField(v.Elem(), b, 0, parseFieldParameters(params))
+	offset, err := parseField(v.Elem(), b, 0, parseFieldParameters(params), 0)
 	if err != nil {
 		return nil, err
 	}

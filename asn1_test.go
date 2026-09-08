@@ -930,7 +930,9 @@ var explicitTaggedTimeTestData = []struct {
 }{
 	{[]byte{0x30, 0x11, 0xa0, 0xf, 0x17, 0xd, '9', '1', '0', '5', '0', '6', '1', '6', '4', '5', '4', '0', 'Z'},
 		explicitTaggedTimeTest{time.Date(1991, 05, 06, 16, 45, 40, 0, time.UTC)}},
-	{[]byte{0x30, 0x17, 0xa0, 0xf, 0x18, 0x13, '2', '0', '1', '0', '0', '1', '0', '2', '0', '3', '0', '4', '0', '5', '+', '0', '6', '0', '7'},
+	// The original copied fixture declared 0x0f for a 0x15-byte child TLV;
+	// correct its wrapper instead of allowing reads outside explicit tags.
+	{[]byte{0x30, 0x17, 0xa0, 0x15, 0x18, 0x13, '2', '0', '1', '0', '0', '1', '0', '2', '0', '3', '0', '4', '0', '5', '+', '0', '6', '0', '7'},
 		explicitTaggedTimeTest{time.Date(2010, 01, 02, 03, 04, 05, 0, time.FixedZone("", 6*60*60+7*60))}},
 }
 

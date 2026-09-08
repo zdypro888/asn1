@@ -185,10 +185,7 @@ func (i uint64Encoder) Len() int {
 func (i uint64Encoder) Encode(dst []byte) {
 	n := i.Len()
 	v := uint64(i)
-	// 前导 0x00 (如果有)
-	if n > 0 && dst[0] == 0 {
-		// 先清零
-	}
+	// Shifting v to zero also emits the optional positive sign byte.
 	for j := 0; j < n; j++ {
 		dst[n-1-j] = byte(v)
 		v >>= 8
@@ -333,8 +330,18 @@ func (oid oidEncoder) Encode(dst []byte) {
 }
 
 func makeObjectIdentifier(oid []int) (e encoder, err error) {
-	if len(oid) < 2 || oid[0] > 2 || (oid[0] < 2 && oid[1] >= 40) {
+	if len(oid) < 2 || oid[0] < 0 || oid[0] > 2 || oid[1] < 0 || (oid[0] < 2 && oid[1] >= 40) {
 		return nil, StructuralError{"invalid object identifier"}
+	}
+	// Previously negative arcs emitted no bytes, and the combined first
+	// subidentifier could overflow int before conversion to int64.
+	if oid[1] > int(^uint(0)>>1)-oid[0]*40 {
+		return nil, StructuralError{"object identifier first subidentifier overflows int"}
+	}
+	for _, arc := range oid[2:] {
+		if arc < 0 {
+			return nil, StructuralError{"negative object identifier arc"}
+		}
 	}
 
 	return oidEncoder(oid), nil
