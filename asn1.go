@@ -164,6 +164,74 @@ func parseInt32(bytes []byte) (int32, error) {
 
 var bigOne = big.NewInt(1)
 
+// parseStructFields parses the fields of a struct from the content bytes of
+// its SEQUENCE.
+func parseStructFields(val reflect.Value, structType reflect.Type, innerBytes []byte, depth int) (err error) {
+	innerOffset := 0
+	for i := 0; i < structType.NumField(); i++ {
+		field := structType.Field(i)
+		if i == 0 && field.Type == rawContentsType {
+			continue
+		}
+		// 跳过非导出字段
+		if !field.IsExported() {
+			continue
+		}
+		fp := parseFieldParameters(field.Tag.Get("asn1"))
+		// asn1:"-" 跳过此字段
+		if fp.skip {
+			continue
+		}
+		// 匿名 struct 字段 (inline): 展平解析其子字段
+		if field.Anonymous && field.Type.Kind() == reflect.Struct {
+			innerOffset, err = parseInlineStruct(val.Field(i), innerBytes, innerOffset, depth)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		innerOffset, err = parseField(val.Field(i), innerBytes, innerOffset, fp, depth)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// wholeSequenceContent returns the content of b when b is exactly one
+// universal SEQUENCE TLV.
+func wholeSequenceContent(b []byte) ([]byte, bool) {
+	t, offset, err := parseTagAndLength(b, 0)
+	if err != nil || t.class != ClassUniversal || t.tag != TagSequence || !t.isCompound {
+		return nil, false
+	}
+	if invalidLength(offset, t.length, len(b)) || offset+t.length != len(b) {
+		return nil, false
+	}
+	return b[offset:], true
+}
+
+// parseAnyInteger decodes an INTEGER whose Go type is not known (decoding into
+// any). Values of up to 8 bytes are returned as int64 exactly as before.
+//
+// 行为变更说明: 超过 8 字节的 INTEGER（例如证书序列号）以前在这里直接返回
+// "integer too large"，导致整个结构解码失败；现在返回 *big.Int。原来能成功
+// 解码的输入结果完全不变，Marshal 对 *big.Int 的编码与原始字节一致。
+func parseAnyInteger(bytes []byte) (any, error) {
+	if len(bytes) > 8 {
+		n, err := parseBigInt(bytes)
+		if err != nil {
+			return nil, err
+		}
+		return n, nil
+	}
+	n, err := parseInt64(bytes)
+	if err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
 // parseBigInt treats the given bytes as a big-endian, signed integer and returns
 // the result.
 func parseBigInt(bytes []byte) (*big.Int, error) {
@@ -789,7 +857,7 @@ func parseAnyElement(bytes []byte, initOffset int, depth int) (result any, offse
 		case TagUTF8String:
 			result, err = parseUTF8String(innerBytes)
 		case TagInteger:
-			result, err = parseInt64(innerBytes)
+			result, err = parseAnyInteger(innerBytes)
 		case TagBitString:
 			result, err = parseBitString(innerBytes)
 		case TagOID:
@@ -938,7 +1006,7 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 			case TagUTF8String:
 				result, err = parseUTF8String(innerBytes)
 			case TagInteger:
-				result, err = parseInt64(innerBytes)
+				result, err = parseAnyInteger(innerBytes)
 			case TagBitString:
 				result, err = parseBitString(innerBytes)
 			case TagOID:
@@ -1214,33 +1282,29 @@ func parseField(v reflect.Value, bytes []byte, initOffset int, params fieldParam
 			val.Field(0).Set(reflect.ValueOf(RawContent(bytes)))
 		}
 
-		innerOffset := 0
-		for i := 0; i < structType.NumField(); i++ {
-			field := structType.Field(i)
-			if i == 0 && field.Type == rawContentsType {
-				continue
-			}
-			// 跳过非导出字段
-			if !field.IsExported() {
-				continue
-			}
-			fp := parseFieldParameters(field.Tag.Get("asn1"))
-			// asn1:"-" 跳过此字段
-			if fp.skip {
-				continue
-			}
-			// 匿名 struct 字段 (inline): 展平解析其子字段
-			if field.Anonymous && field.Type.Kind() == reflect.Struct {
-				innerOffset, err = parseInlineStruct(val.Field(i), innerBytes, innerOffset, depth)
-				if err != nil {
-					return
+		err = parseStructFields(val, structType, innerBytes, depth)
+		if err != nil && bitStringWrapped {
+			// 行为变更说明: `bitstring` 结构体字段历来把 BIT STRING 内容直接当作
+			// 字段序列解析（本包 Marshal 也是这样编码的，保持不变）。X.509 风格的
+			// 数据是 BIT STRING { 00, SEQUENCE { 字段... } }，以前在这里必然失败。
+			// 现在仅当原有解析失败、且内容恰好是一个完整的 SEQUENCE 时，才改为解析
+			// 该 SEQUENCE 的内容；原来能成功解码的输入走的仍是上面的原路径。
+			if seq, ok := wholeSequenceContent(innerBytes); ok {
+				raw := reflect.Value{}
+				if structType.NumField() > 0 && structType.Field(0).Type == rawContentsType {
+					raw = reflect.ValueOf(val.Field(0).Interface())
 				}
-				continue
+				val.Set(reflect.Zero(structType))
+				if raw.IsValid() {
+					val.Field(0).Set(raw)
+				}
+				if err2 := parseStructFields(val, structType, seq, depth); err2 == nil {
+					err = nil
+				}
 			}
-			innerOffset, err = parseField(val.Field(i), innerBytes, innerOffset, fp, depth)
-			if err != nil {
-				return
-			}
+		}
+		if err != nil {
+			return
 		}
 		// We allow extra bytes at the end of the SEQUENCE because
 		// adding elements to the end has been used in X.509 as the

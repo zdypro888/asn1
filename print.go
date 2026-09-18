@@ -2,6 +2,7 @@ package asn1
 
 import (
 	"fmt"
+	"math/big"
 	"strings"
 )
 
@@ -38,6 +39,8 @@ func PrintAny(b *strings.Builder, v any, indent string) {
 		fmt.Fprintf(b, "%sBOOLEAN: %v\n", indent, val)
 	case int64:
 		fmt.Fprintf(b, "%sINTEGER: %d\n", indent, val)
+	case *big.Int:
+		fmt.Fprintf(b, "%sINTEGER: %s\n", indent, val.String())
 	case string:
 		fmt.Fprintf(b, "%sSTRING: %q\n", indent, val)
 	case []byte:
