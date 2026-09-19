@@ -831,6 +831,10 @@ type CompoundValue struct {
 	Class int
 	Tag   int
 	Items []any
+	// ItemTags[i] 是 Items[i] 解码时的 universal tag（非 universal 或复合元素为 0），
+	// 由解码器填写，仅用于重新编码字符串和时间，见 makeCompoundValue。
+	// 手工构造的 CompoundValue 可以不填，编码行为与之前相同。
+	ItemTags []int
 }
 
 // parseAnyElement 从 bytes[offset:] 解析一个 ASN.1 元素为 any 类型。
@@ -901,16 +905,22 @@ func parseAnyElement(bytes []byte, initOffset int, depth int) (result any, offse
 // parseCompoundAny 递归解析复合类型 (SEQUENCE/SET/constructed) 内部的所有子元素为 []any。
 func parseCompoundAny(t tagAndLength, innerBytes []byte, depth int) (*CompoundValue, error) {
 	var items []any
+	var itemTags []int
 	pos := 0
 	for pos < len(innerBytes) {
+		itemTag := 0
+		if et, _, tagErr := parseTagAndLength(innerBytes, pos); tagErr == nil && et.class == ClassUniversal && !et.isCompound {
+			itemTag = et.tag
+		}
 		elem, newPos, err := parseAnyElement(innerBytes, pos, depth)
 		if err != nil {
 			return nil, err
 		}
 		items = append(items, elem)
+		itemTags = append(itemTags, itemTag)
 		pos = newPos
 	}
-	return &CompoundValue{Class: t.class, Tag: t.tag, Items: items}, nil
+	return &CompoundValue{Class: t.class, Tag: t.tag, Items: items, ItemTags: itemTags}, nil
 }
 
 // parseField is the main parsing function. Given a byte slice and an offset

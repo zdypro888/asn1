@@ -638,8 +638,29 @@ func makeCompoundValue(cv CompoundValue, params fieldParameters) (encoder, error
 		body = bytesEncoder(nil)
 	} else {
 		m := make([]encoder, 0, len(cv.Items))
-		for _, item := range cv.Items {
-			enc, err := makeField(reflect.ValueOf(item), fieldParameters{})
+		for i, item := range cv.Items {
+			// 行为变更说明: 解码到 any 时字符串和时间都变成 Go 的 string / time.Time，
+			// 原来的类型丢失，重新编码一律成了 UTF8String / UTCTime：
+			// 字符串一律按"能用 PrintableString 就用、否则 UTF8String"重新选择，
+			// IA5String / NumericString / UTF8String 的原类型因此丢失，
+			// GeneralizedTime 会变成 UTCTime，重新编码后的 DER 与输入不同（签名结构
+			// 因此无法验签）。解码器现在在 ItemTags 里记下原类型，这里据此选回原来的
+			// 编码。没有 ItemTags（手工构造的值）或值的类型已被调用方替换时，行为不变。
+			itemParams := fieldParameters{}
+			if i < len(cv.ItemTags) {
+				switch item.(type) {
+				case string:
+					switch cv.ItemTags[i] {
+					case TagIA5String, TagPrintableString, TagNumericString, TagUTF8String:
+						itemParams.stringType = cv.ItemTags[i]
+					}
+				case time.Time:
+					if cv.ItemTags[i] == TagGeneralizedTime {
+						itemParams.timeType = TagGeneralizedTime
+					}
+				}
+			}
+			enc, err := makeField(reflect.ValueOf(item), itemParams)
 			if err != nil {
 				return nil, err
 			}
