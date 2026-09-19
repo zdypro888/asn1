@@ -735,6 +735,11 @@ func makeField(v reflect.Value, params fieldParameters) (e encoder, err error) {
 	}
 
 	// 扩展: omitEmpty 支持 slice (含 []byte)、string、int 零值
+	// 注意（已知限制，未改）: 标量字段的 omitempty 在编码和解码之间并不对称。解码端把
+	// omitempty 当作 optional，只能靠 tag 判断字段是否存在；相邻的同类型字段没有可区分
+	// 的 tag 时，被省略的字段会吞掉后一个字段的值
+	// （{A int `omitempty`; B int}{0,7} 解回来是 A=7，然后 "sequence truncated"）。
+	// 需要对称时给这类字段加上各自的 `tag:N`。改变这里会改变已有编码的字节，所以保持原样。
 	// fromPointer=true 时跳过: 非 nil 指针解引用后的值应始终编码
 	if params.omitEmpty && !params.fromPointer {
 		switch v.Kind() {
