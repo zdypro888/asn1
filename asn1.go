@@ -164,6 +164,25 @@ func parseInt32(bytes []byte) (int32, error) {
 
 var bigOne = big.NewInt(1)
 
+// inlinesAnonymous reports whether an embedded struct field is flattened into
+// its parent (its fields are parsed / encoded in place of the field itself).
+//
+// 行为变更说明: 以前所有匿名 struct 字段都被摊平，包括本包自己当作"原子值"处理的
+// time.Time、BitString 和 RawValue：嵌入 time.Time 时编码出来的是没有 tag/length 的
+// 裸时间字节，解码则必然以 "tags don't match" 失败，没有任何输入能来回一致。这几种
+// 类型现在按普通字段处理（UTCTime/GeneralizedTime、BIT STRING、原始 TLV）。其它
+// 匿名 struct 的摊平行为不变。
+func inlinesAnonymous(field reflect.StructField) bool {
+	if !field.Anonymous || field.Type.Kind() != reflect.Struct {
+		return false
+	}
+	switch field.Type {
+	case timeType, bitStringType, rawValueType:
+		return false
+	}
+	return true
+}
+
 // parseStructFields parses the fields of a struct from the content bytes of
 // its SEQUENCE.
 func parseStructFields(val reflect.Value, structType reflect.Type, innerBytes []byte, depth int) (err error) {
@@ -183,7 +202,7 @@ func parseStructFields(val reflect.Value, structType reflect.Type, innerBytes []
 			continue
 		}
 		// 匿名 struct 字段 (inline): 展平解析其子字段
-		if field.Anonymous && field.Type.Kind() == reflect.Struct {
+		if inlinesAnonymous(field) {
 			innerOffset, err = parseInlineStruct(val.Field(i), innerBytes, innerOffset, depth)
 			if err != nil {
 				return err
@@ -1374,7 +1393,7 @@ func parseInlineStruct(v reflect.Value, bytes []byte, offset int, depth int) (in
 		if fp.skip {
 			continue
 		}
-		if field.Anonymous && field.Type.Kind() == reflect.Struct {
+		if inlinesAnonymous(field) {
 			var err error
 			offset, err = parseInlineStruct(v.Field(i), bytes, offset, depth)
 			if err != nil {

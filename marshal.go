@@ -562,7 +562,7 @@ func makeBody(value reflect.Value, params fieldParameters) (e encoder, err error
 				continue
 			}
 			// 匿名 struct 字段 (inline): 展平其子字段
-			if field.Anonymous && field.Type.Kind() == reflect.Struct {
+			if inlinesAnonymous(field) {
 				enc, innerErr := makeBody(v.Field(i), fp)
 				if innerErr != nil {
 					return nil, innerErr
