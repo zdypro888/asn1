@@ -451,14 +451,27 @@ func parseBase128Int(bytes []byte, initOffset int) (ret, offset int, err error) 
 
 // UTCTime
 
+var errUTCTimeTryBoth = errors.New("asn1: try both UTCTime layouts")
+
 func parseUTCTime(bytes []byte) (ret time.Time, err error) {
 	s := string(bytes)
 
-	formatStr := "0601021504Z0700"
-	ret, err = time.Parse(formatStr, s)
-	if err != nil {
-		formatStr = "060102150405Z0700"
+	// 两种格式按长度互斥：无秒的是 11 或 15 个字符，有秒的是 13 或 17 个。证书里的时间
+	// 几乎都带秒，先按无秒格式解析必然失败并白白构造一个 ParseError，所以长度对得上
+	// 时先试有秒的格式；失败再按原来的顺序走一遍，返回的错误与之前相同。
+	formatStr := "060102150405Z0700"
+	if len(s) == 13 || len(s) == 17 {
 		ret, err = time.Parse(formatStr, s)
+	} else {
+		err = errUTCTimeTryBoth
+	}
+	if err != nil {
+		formatStr = "0601021504Z0700"
+		ret, err = time.Parse(formatStr, s)
+		if err != nil {
+			formatStr = "060102150405Z0700"
+			ret, err = time.Parse(formatStr, s)
+		}
 	}
 	if err != nil {
 		return
@@ -904,8 +917,22 @@ func parseAnyElement(bytes []byte, initOffset int, depth int) (result any, offse
 
 // parseCompoundAny 递归解析复合类型 (SEQUENCE/SET/constructed) 内部的所有子元素为 []any。
 func parseCompoundAny(t tagAndLength, innerBytes []byte, depth int) (*CompoundValue, error) {
+	// 先数一遍元素个数（只解析 tag 和长度，不分配），两个切片一次分配到位。
+	// 数的过程中遇到错误就停，由下面的正式解析报告同样的错误。
+	count := 0
+	for pos := 0; pos < len(innerBytes); count++ {
+		et, next, tagErr := parseTagAndLength(innerBytes, pos)
+		if tagErr != nil || invalidLength(next, et.length, len(innerBytes)) {
+			break
+		}
+		pos = next + et.length
+	}
 	var items []any
 	var itemTags []int
+	if count > 0 {
+		items = make([]any, 0, count)
+		itemTags = make([]int, 0, count)
+	}
 	pos := 0
 	for pos < len(innerBytes) {
 		itemTag := 0
